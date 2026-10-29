@@ -52,6 +52,8 @@ AddressParse::parse($address, [
     'type' => AddressParse::TYPE_TREE,  // 0 正则匹配（默认）/ 1 行政区划树查找
     'nameMaxLength' => 4,               // 中文姓名最大长度，默认 4（复姓/少数民族长名可调大）
     'textFilter' => ['备注', '订单号'],  // 额外要清洗掉的词
+    'cache' => true,                    // 启用持久化文件缓存（默认 false，见下方「缓存」）
+    'cachePath' => '/var/cache/addressparse.cache', // 自定义缓存文件路径（可选）
     'extraGovData' => [                 // 本次调用临时补充的区划（不影响后续调用）
         'province' => [['code' => '990000', 'name' => '测试省']],
         'city'     => [['code' => '990100', 'name' => '测试市', 'provinceCode' => '990000']],
@@ -60,8 +62,27 @@ AddressParse::parse($address, [
 ]);
 ```
 
-键名同时支持 snake_case（`name_max_length` / `text_filter` / `extra_gov_data`），直接把请求参数丢进去也不会炸。
+键名同时支持 snake_case（`name_max_length` / `text_filter` / `extra_gov_data` / `cache_path`），直接把请求参数丢进去也不会炸。
 参数非法（`type` 传 `abc`、`nameMaxLength` 传汉字）会静默回落到默认值，不抛异常。
+
+### 缓存
+
+PHP-FPM / mod_php 下每个请求都是新进程，类里的静态属性只在单次请求内复用；不开缓存时每个请求都要重新读取并 `json_decode` 约 140KB 的 `provinceList.json`、再建一次索引。
+
+开启后会把「已解析好的区划数据」序列化成一个缓存文件，下个请求直接反序列化，跳过读文件 + JSON 解析 + 建索引。实测冷启动从约 175ms 降到约 11ms，解析结果完全一致。
+
+```php
+// 方式一：全局开启一次（推荐，放在 AppServiceProvider::boot() 里）
+AddressParse::setCache(true);                                        // 默认缓存到 data/addressparse.cache
+AddressParse::setCache(true, storage_path('app/addressparse.cache')); // 自定义路径
+
+// 方式二：按调用开启
+AddressParse::parse($address, ['cache' => true]);
+```
+
+- 缓存文件比源 json 旧（你更新了区划数据）时会**自动失效重建**，无需手动清理。
+- 写入失败（目录不可写等）不会抛异常，会静默回落到无缓存，不影响解析。
+- 缓存文件是运行期数据，**不要提交进 git**（`.gitignore` 已忽略 `*.cache`）。
 
 ### 其他方法
 
@@ -69,6 +90,7 @@ AddressParse::parse($address, [
 AddressParse::clean($text, ['备注']);                    // 只做清洗，返回字符串
 AddressParse::setDataPath(storage_path('app/address-parse'));  // 区划数据不在类同级 data 目录时指定
 AddressParse::dataPath();                                // 当前使用的数据目录
+AddressParse::setCache(true, storage_path('app/addressparse.cache'));  // 开启持久化缓存并指定路径
 ```
 
 数据目录默认是**类文件同级**的 `data/`。想把区划数据放别处，在 `AppServiceProvider::boot()` 里指定一次即可。

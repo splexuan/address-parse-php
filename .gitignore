@@ -8,3 +8,7 @@ _*.py
 _*.php
 _*.csv
 *.log
+
+# 运行期持久化缓存
+*.cache
+data/addressparse.cache

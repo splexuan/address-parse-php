@@ -139,6 +139,9 @@ class AddressParse
     /** 名称包含该词的城市节点会被扁平化，子节点提升一级 */
     const FLATTEN_CITY_KEYWORDS = array('行政区划');
 
+    /** 持久化缓存的数据结构版本号（改动缓存字段时递增，旧缓存会自动失效重建） */
+    const CACHE_VERSION = 1;
+
     /** @var string|null 区划数据目录（null 表示使用 __DIR__/data） */
     private static $dataPath = null;
 
@@ -160,6 +163,12 @@ class AddressParse
 
     /** @var array 省/市/区县名称集合（含去后缀简称），用于排除"江阴""朝阳"这类地名被当成人名 */
     private static $regionNames = array();
+
+    /** @var bool 是否启用持久化文件缓存（跨进程复用已解析的数据） */
+    private static $cacheEnabled = false;
+
+    /** @var string|null 缓存文件路径（null 表示 dataPath()/addressparse.cache） */
+    private static $cachePath = null;
 
     /**
      * 指定区划数据目录（默认用本文件同级 data 目录）
@@ -188,6 +197,32 @@ class AddressParse
     }
 
     /**
+     * 启用/关闭持久化文件缓存
+     *
+     * PHP-FPM / mod_php 每个请求都是新进程，静态属性只在单次请求内复用；
+     * 开启后会把「已解析好的区划数据」写入一个缓存文件，下次请求直接反序列化，
+     * 省掉每次读取 + json_decode 142KB + 建索引的开销。缓存文件比源 json 旧时自动重建。
+     *
+     * 缓存写入失败（目录不可写等）不会抛异常，会静默回落到无缓存。
+     *
+     * @param  bool        $enabled 是否启用
+     * @param  string|null $path    缓存文件路径（null 用 dataPath()/addressparse.cache）
+     * @return void
+     */
+    public static function setCache($enabled = true, $path = null)
+    {
+        $newEnabled = self::normalizeBool($enabled, self::$cacheEnabled);
+        $newPath = $path !== null ? rtrim((string) $path, '/\\') : self::$cachePath;
+
+        if ($newEnabled !== self::$cacheEnabled || $newPath !== self::$cachePath) {
+            // 缓存配置变化，需要重新加载才能生效
+            self::$loaded = false;
+        }
+        self::$cacheEnabled = $newEnabled;
+        self::$cachePath = $newPath;
+    }
+
+    /**
      * 解析地址
      *
      * @param  string|null $address 待解析文本
@@ -205,6 +240,17 @@ class AddressParse
 
         if ($address === null || $address === '') {
             return $empty;
+        }
+
+        // 缓存选项必须在 load() 之前应用
+        $cacheOpt = isset($options['cache']) ? $options['cache'] : null;
+        $cachePathOpt = isset($options['cachePath']) ? $options['cachePath']
+            : (isset($options['cache_path']) ? $options['cache_path'] : null);
+        if ($cacheOpt !== null || $cachePathOpt !== null) {
+            self::setCache(
+                $cacheOpt === null ? self::$cacheEnabled : $cacheOpt,
+                (is_string($cachePathOpt) && $cachePathOpt !== '') ? $cachePathOpt : null
+            );
         }
 
         self::load();
@@ -440,6 +486,11 @@ class AddressParse
             return;
         }
 
+        if (self::$cacheEnabled && self::readCache()) {
+            self::$loaded = true;
+            return;
+        }
+
         $tree = self::readJson(self::dataPath() . DIRECTORY_SEPARATOR . 'provinceList.json');
         $names = self::readJson(self::dataPath() . DIRECTORY_SEPARATOR . 'names.json');
 
@@ -565,6 +616,112 @@ class AddressParse
         }
 
         self::$loaded = true;
+
+        if (self::$cacheEnabled) {
+            self::writeCache();
+        }
+    }
+
+    /**
+     * 缓存文件路径
+     *
+     * @return string
+     */
+    private static function cacheFile()
+    {
+        if (self::$cachePath !== null && self::$cachePath !== '') {
+            return self::$cachePath;
+        }
+
+        return self::dataPath() . DIRECTORY_SEPARATOR . 'addressparse.cache';
+    }
+
+    /**
+     * 尝试从缓存文件恢复已解析数据；成功返回 true
+     *
+     * @return bool
+     */
+    private static function readCache()
+    {
+        $file = self::cacheFile();
+        if (!is_file($file)) {
+            return false;
+        }
+
+        // 任一源 json 比缓存新，视为过期
+        $cacheTime = @filemtime($file);
+        $srcTime = max(
+            @filemtime(self::dataPath() . DIRECTORY_SEPARATOR . 'provinceList.json'),
+            @filemtime(self::dataPath() . DIRECTORY_SEPARATOR . 'names.json')
+        );
+        if ($cacheTime === false || $srcTime === false || $cacheTime < $srcTime) {
+            return false;
+        }
+
+        $raw = @file_get_contents($file);
+        if ($raw === false) {
+            return false;
+        }
+
+        $data = @unserialize($raw);
+        if (!is_array($data) || !isset($data['v']) || $data['v'] !== self::CACHE_VERSION) {
+            return false;
+        }
+
+        $keys = array('provinces', 'cities', 'areas', 'provinceString', 'cityString', 'areaString', 'nameSet', 'regionNames');
+        foreach ($keys as $key) {
+            if (!array_key_exists($key, $data)) {
+                return false;
+            }
+        }
+
+        self::$provinces = $data['provinces'];
+        self::$cities = $data['cities'];
+        self::$areas = $data['areas'];
+        self::$provinceString = $data['provinceString'];
+        self::$cityString = $data['cityString'];
+        self::$areaString = $data['areaString'];
+        self::$nameSet = $data['nameSet'];
+        self::$regionNames = $data['regionNames'];
+
+        return true;
+    }
+
+    /**
+     * 把已解析数据写入缓存文件（失败静默忽略，不影响正常解析）
+     *
+     * @return void
+     */
+    private static function writeCache()
+    {
+        $data = array(
+            'v' => self::CACHE_VERSION,
+            'provinces' => self::$provinces,
+            'cities' => self::$cities,
+            'areas' => self::$areas,
+            'provinceString' => self::$provinceString,
+            'cityString' => self::$cityString,
+            'areaString' => self::$areaString,
+            'nameSet' => self::$nameSet,
+            'regionNames' => self::$regionNames,
+        );
+
+        $raw = serialize($data);
+        $file = self::cacheFile();
+
+        $dir = dirname($file);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0777, true);
+        }
+
+        // 原子写入：先写临时文件再 rename，避免并发读到半截内容
+        $tmp = $file . '.' . getmypid() . '.tmp';
+        if (@file_put_contents($tmp, $raw, LOCK_EX) === false) {
+            return;
+        }
+        if (!@rename($tmp, $file)) {
+            @unlink($tmp);
+        }
     }
 
     /**
@@ -1659,6 +1816,32 @@ class AddressParse
         }
         if (is_string($raw) && preg_match('/^\s*[+-]?\d+\s*$/', $raw)) {
             return (int) trim($raw);
+        }
+
+        return $default;
+    }
+
+    /**
+     * 宽松布尔归一化："0"/"false"/"off"/"no"/"" → false，其余非空 → true
+     *
+     * @param  mixed $raw
+     * @param  bool  $default
+     * @return bool
+     */
+    private static function normalizeBool($raw, $default = false)
+    {
+        if (is_bool($raw)) {
+            return $raw;
+        }
+        if (is_int($raw) || is_float($raw)) {
+            return $raw != 0;
+        }
+        if (is_string($raw)) {
+            $value = strtolower(trim($raw));
+            if ($value === '') {
+                return $default;
+            }
+            return !in_array($value, array('0', 'false', 'off', 'no', 'null', 'none'), true);
         }
 
         return $default;
