@@ -74,15 +74,18 @@ PHP-FPM / mod_php 下每个请求都是新进程，类里的静态属性只在�
 ```php
 // 方式一：全局开启一次（推荐，放在 AppServiceProvider::boot() 里）
 AddressParse::setCache(true);                                        // 默认缓存到 data/addressparse.cache
-AddressParse::setCache(true, storage_path('app/addressparse.cache')); // 自定义路径
+AddressParse::setCache(true, storage_path('app/addressparse.cache')); // 自定义路径（完整文件路径）
+AddressParse::setCache(true, storage_path('app/cache'));             // 传目录也行：自动补 addressparse.cache
 
 // 方式二：按调用开启
 AddressParse::parse($address, ['cache' => true]);
 ```
 
+- `setCache` 第二个参数是**缓存文件的完整路径（含文件名）**，不是目录；万一传了目录（已存在或以 `/` `\` 结尾）会自动补上文件名 `addressparse.cache`，不会静默失效。
 - 缓存文件比源 json 旧（你更新了区划数据）时会**自动失效重建**，无需手动清理。
+- 并发重建加锁保护：多个 worker 同时发现缓存过期时，只有一个真正重建，其余等它建好直接复用，避免重复 CPU。
 - 写入失败（目录不可写等）不会抛异常，会静默回落到无缓存，不影响解析。
-- 缓存文件是运行期数据，**不要提交进 git**（`.gitignore` 已忽略 `*.cache`）。
+- 缓存文件是运行期数据，**不要提交进 git**（`.gitignore` 已忽略 `*.cache` / `*.cache.lock`）。
 
 ### 其他方法
 

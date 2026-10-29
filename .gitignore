@@ -11,4 +11,6 @@ _*.csv
 
 # 运行期持久化缓存
 *.cache
+*.cache.lock
+*.cache.*.tmp
 data/addressparse.cache

@@ -206,13 +206,16 @@ class AddressParse
      * 缓存写入失败（目录不可写等）不会抛异常，会静默回落到无缓存。
      *
      * @param  bool        $enabled 是否启用
-     * @param  string|null $path    缓存文件路径（null 用 dataPath()/addressparse.cache）
+     * @param  string|null $path    缓存文件的**完整路径（含文件名）**，不是目录；
+     *                              例如 /var/cache/addressparse.cache。传 null 用
+     *                              dataPath()/addressparse.cache。若误传了目录（已存在
+     *                              或以 / \ 结尾），会自动补上文件名 addressparse.cache。
      * @return void
      */
     public static function setCache($enabled = true, $path = null)
     {
         $newEnabled = self::normalizeBool($enabled, self::$cacheEnabled);
-        $newPath = $path !== null ? rtrim((string) $path, '/\\') : self::$cachePath;
+        $newPath = $path !== null ? self::resolveCachePath((string) $path) : self::$cachePath;
 
         if ($newEnabled !== self::$cacheEnabled || $newPath !== self::$cachePath) {
             // 缓存配置变化，需要重新加载才能生效
@@ -220,6 +223,22 @@ class AddressParse
         }
         self::$cacheEnabled = $newEnabled;
         self::$cachePath = $newPath;
+    }
+
+    /**
+     * 归一化缓存路径：传目录（已存在或以分隔符结尾）时自动补默认文件名，避免把目录当文件用。
+     *
+     * @param  string $path
+     * @return string
+     */
+    private static function resolveCachePath($path)
+    {
+        $trimmed = rtrim($path, '/\\');
+        $isDir = $path !== $trimmed || ($trimmed !== '' && is_dir($trimmed));
+
+        return ($isDir && $trimmed !== '')
+            ? $trimmed . DIRECTORY_SEPARATOR . 'addressparse.cache'
+            : $trimmed;
     }
 
     /**
@@ -478,7 +497,9 @@ class AddressParse
     // ============================================================
 
     /**
-     * 加载区划数据（只读一次）
+     * 加载区划数据（每个进程只读一次）
+     *
+     * 开启缓存时：先读缓存文件；缺失/过期则加锁重建，避免多 worker 同时重建（重复 CPU）。
      */
     private static function load()
     {
@@ -486,11 +507,43 @@ class AddressParse
             return;
         }
 
-        if (self::$cacheEnabled && self::readCache()) {
+        if (!self::$cacheEnabled) {
+            self::buildData();
             self::$loaded = true;
             return;
         }
 
+        if (self::readCache()) {
+            self::$loaded = true;
+            return;
+        }
+
+        // 缓存缺失/过期：加锁后双重检查，保证同一时刻只有一个进程重建
+        $lock = self::acquireLock();
+        if ($lock !== false) {
+            if (self::readCache()) {
+                // 等锁期间别的进程已经重建好了，直接用
+                self::releaseLock($lock);
+                self::$loaded = true;
+                return;
+            }
+            self::buildData();
+            self::$loaded = true;
+            self::writeCache();
+            self::releaseLock($lock);
+            return;
+        }
+
+        // 拿不到锁（如缓存目录不可写）：照常构建，保证解析正确，只是不写缓存
+        self::buildData();
+        self::$loaded = true;
+    }
+
+    /**
+     * 从 json 读取并构建全部内存数据（不设置 loaded、不写缓存）
+     */
+    private static function buildData()
+    {
         $tree = self::readJson(self::dataPath() . DIRECTORY_SEPARATOR . 'provinceList.json');
         $names = self::readJson(self::dataPath() . DIRECTORY_SEPARATOR . 'names.json');
 
@@ -615,11 +668,6 @@ class AddressParse
             }
         }
 
-        self::$loaded = true;
-
-        if (self::$cacheEnabled) {
-            self::writeCache();
-        }
     }
 
     /**
@@ -721,6 +769,55 @@ class AddressParse
         }
         if (!@rename($tmp, $file)) {
             @unlink($tmp);
+        }
+    }
+
+    /**
+     * 获取重建缓存用的排他锁（有界等待，拿不到返回 false）
+     *
+     * 用独立 .lock 文件，避免多 worker 同时重建缓存。等待最多 2 秒：正常情况下
+     * 别的进程构建只需百毫秒级；超时或锁文件不可创建时返回 false，调用方会直接构建，
+     * 保证解析正确且绝不卡死。
+     *
+     * @return resource|false
+     */
+    private static function acquireLock()
+    {
+        $file = self::cacheFile();
+        $dir = dirname($file);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0777, true);
+        }
+
+        $handle = @fopen($file . '.lock', 'c');
+        if ($handle === false) {
+            return false;
+        }
+
+        $deadline = microtime(true) + 2.0;
+        while (true) {
+            if (@flock($handle, LOCK_EX | LOCK_NB)) {
+                return $handle;
+            }
+            if (microtime(true) >= $deadline) {
+                @fclose($handle);
+                return false;
+            }
+            usleep(10000); // 10ms 后再试
+        }
+    }
+
+    /**
+     * 释放重建缓存用的锁
+     *
+     * @param  resource|false $handle
+     * @return void
+     */
+    private static function releaseLock($handle)
+    {
+        if (is_resource($handle)) {
+            @flock($handle, LOCK_UN);
+            @fclose($handle);
         }
     }
 
